@@ -3673,7 +3673,7 @@ int32_t ExynosDisplay::presentDisplay(int32_t* outRetireFence) {
     thread_local bool setTaskProfileDone = false;
 
     if (setTaskProfileDone == false) {
-        if (!SetTaskProfiles(gettid(), {"SFMainPolicy"})) {
+        if (!SetTaskProfiles(gettid(), {"SFMainPolicyOverride"})) {
             ALOGW("Failed to add `%d` into SFMainPolicy", gettid());
         }
         setTaskProfileDone = true;
