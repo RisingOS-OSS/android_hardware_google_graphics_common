@@ -235,7 +235,7 @@ ExynosPrimaryDisplay::ExynosPrimaryDisplay(uint32_t index, ExynosDevice* device,
             if (content.has_value() &&
                 !(content.value().compare(0, kRefreshControlNodeEnabled.length(),
                                           kRefreshControlNodeEnabled))) {
-                bool ret = fileNode->WriteUint32(kRefreshControlNodeName, refreshControlCommand);
+                bool ret = fileNode->writeValue(kRefreshControlNodeName, refreshControlCommand);
                 if (!ret) {
                     ALOGE("%s(): write command to file node %s%s failed.", __func__,
                           displayFileNodePath.c_str(), kRefreshControlNodeName.c_str());
@@ -853,9 +853,9 @@ int32_t ExynosPrimaryDisplay::getDisplayConfigs(uint32_t* outNumConfigs,
 int32_t ExynosPrimaryDisplay::presentDisplay(int32_t* outRetireFence) {
     auto res = ExynosDisplay::presentDisplay(outRetireFence);
     // Forward presentDisplay if there is a listener.
-    const auto presentListener = getPresentListener();
-    if (res == HWC2_ERROR_NONE && presentListener) {
-        presentListener->onPresent(*outRetireFence);
+    const auto refreshListener = getRefreshListener();
+    if (res == HWC2_ERROR_NONE && refreshListener) {
+        refreshListener->onPresent(*outRetireFence);
     }
     return res;
 }
@@ -868,6 +868,8 @@ void ExynosPrimaryDisplay::onVsync(int64_t timestamp) {
 }
 
 int32_t ExynosPrimaryDisplay::notifyExpectedPresent(int64_t timestamp, int32_t frameIntervalNs) {
+    DISPLAY_ATRACE_INT64("expectedPresentTimeDelta", timestamp - systemTime());
+    DISPLAY_ATRACE_INT("frameInterval", frameIntervalNs);
     if (mVariableRefreshRateController) {
         mVariableRefreshRateController->notifyExpectedPresent(timestamp, frameIntervalNs);
     }
@@ -925,6 +927,13 @@ int32_t ExynosPrimaryDisplay::setLhbmDisplayConfigLocked(uint32_t peakRate) {
 
 void ExynosPrimaryDisplay::restoreLhbmDisplayConfigLocked() {
     enableConfigSetting(true);
+
+    if (*mPowerModeState == HWC2_POWER_MODE_DOZE ||
+        *mPowerModeState == HWC2_POWER_MODE_DOZE_SUSPEND) {
+        DISPLAY_LOGI("%s: in aod mode(%d), skip restore", __func__, *mPowerModeState);
+        return;
+    }
+
     hwc2_config_t pendingConfig = mPendingConfig;
     auto hwConfig = mDisplayInterface->getActiveModeId();
     if (pendingConfig != UINT_MAX && pendingConfig != hwConfig) {
@@ -1142,11 +1151,14 @@ void ExynosPrimaryDisplay::setEarlyWakeupDisplay() {
 }
 
 void ExynosPrimaryDisplay::setExpectedPresentTime(uint64_t timestamp, int frameIntervalNs) {
+    DISPLAY_ATRACE_INT64("expectedPresentTimeDelta", timestamp - systemTime());
+    DISPLAY_ATRACE_INT("frameInterval", frameIntervalNs);
+
     mExpectedPresentTimeAndInterval.store(std::make_tuple(timestamp, frameIntervalNs));
     // Forward presentDisplay if there is a listener.
-    const auto presentListener = getPresentListener();
-    if (presentListener) {
-        presentListener->setExpectedPresentTime(timestamp, frameIntervalNs);
+    const auto refreshListener = getRefreshListener();
+    if (refreshListener) {
+        refreshListener->setExpectedPresentTime(timestamp, frameIntervalNs);
     }
 }
 
@@ -1342,6 +1354,13 @@ int32_t ExynosPrimaryDisplay::setDisplayTemperature(const int temperature) {
     return HWC2_ERROR_UNSUPPORTED;
 }
 
+void ExynosPrimaryDisplay::onProximitySensorStateChanged(bool active) {
+    if (mProximitySensorStateChangeCallback) {
+        ALOGI("ExynosPrimaryDisplay: %s: %d", __func__, active);
+        mProximitySensorStateChangeCallback->onProximitySensorStateChanged(active);
+    }
+}
+
 int32_t ExynosPrimaryDisplay::setMinIdleRefreshRate(const int targetFps,
                                                     const RrThrottleRequester requester) {
     if (targetFps < 0) {
@@ -1402,6 +1421,9 @@ int32_t ExynosPrimaryDisplay::setMinIdleRefreshRate(const int targetFps,
             ALOGD("%s: proximity state %s, min %dhz, doze mode %d", __func__,
                   proximityActive ? "active" : "inactive", targetFps, dozeMode);
             mDisplayTe2Manager->updateTe2OptionForProximity(proximityActive, targetFps, dozeMode);
+            if (!dozeMode) {
+                mDisplayTe2Manager->handleProximitySensorStateChange(proximityActive);
+            }
         }
 
         if (maxMinIdleFps == mMinIdleRefreshRate) return NO_ERROR;
@@ -1494,7 +1516,7 @@ int32_t ExynosPrimaryDisplay::setRefreshRateThrottleNanos(const int64_t delayNan
     return ret;
 }
 
-void ExynosPrimaryDisplay::dump(String8 &result) {
+void ExynosPrimaryDisplay::dump(String8& result, const std::vector<std::string>& args) {
     ExynosDisplay::dump(result);
     result.appendFormat("Display idle timer: %s\n",
                         (mDisplayIdleTimerEnabled) ? "enabled" : "disabled");
@@ -1533,6 +1555,22 @@ void ExynosPrimaryDisplay::dump(String8 &result) {
         result.appendFormat("Temperature : %d°C\n", mDisplayTemperature);
     }
     result.appendFormat("\n");
+
+    DisplayType displayType = getDcDisplayType();
+    std::string displayTypeIdentifier;
+    if (displayType == DisplayType::DISPLAY_PRIMARY) {
+        displayTypeIdentifier = "primarydisplay";
+    } else if (displayType == DisplayType::DISPLAY_EXTERNAL) {
+        displayTypeIdentifier = "externaldisplay";
+    }
+    if (!displayTypeIdentifier.empty()) {
+        auto xrrVersion =
+                android::hardware::graphics::composer::getDisplayXrrVersion(displayTypeIdentifier);
+        result.appendFormat("XRR version: %d.%d\n", xrrVersion.first, xrrVersion.second);
+    }
+    if (mVariableRefreshRateController) {
+        mVariableRefreshRateController->dump(result, args);
+    }
 }
 
 void ExynosPrimaryDisplay::calculateTimelineLocked(
@@ -1556,7 +1594,7 @@ void ExynosPrimaryDisplay::calculateTimelineLocked(
         std::lock_guard<std::mutex> lock(mIdleRefreshRateThrottleMutex);
         threshold = mRefreshRateDelayNanos;
         mRrUseDelayNanos = 0;
-        mIsRrNeedCheckDelay =
+        mIsRrNeedCheckDelay = !mXrrSettings.versionInfo.needVrrParameters() &&
                 mDisplayConfigs[mActiveConfig].vsyncPeriod < mDisplayConfigs[config].vsyncPeriod;
         if (threshold != 0 && mLastRefreshRateAppliedNanos != 0 && mIsRrNeedCheckDelay) {
             lastUpdateDelta = desiredUpdateTimeNanos - mLastRefreshRateAppliedNanos;
@@ -1689,7 +1727,7 @@ int32_t ExynosPrimaryDisplay::setDbmState(bool enabled) {
     return NO_ERROR;
 }
 
-PresentListener* ExynosPrimaryDisplay::getPresentListener() {
+RefreshListener* ExynosPrimaryDisplay::getRefreshListener() {
     if (mVariableRefreshRateController) {
         return mVariableRefreshRateController.get();
     }
